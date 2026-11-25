@@ -42,6 +42,47 @@ Use ``pip`` to install these utilities::
 
 The ``packaging`` library uses calendar-based versioning (``YY.N``).
 
+Building and Testing from Source
+--------------------------------
+
+Requires **Python 3.10 or newer** (no third-party runtime dependencies).
+
+1. Clone the repository and enter the project directory::
+
+       git clone https://github.com/ParamKataria/packaging.git
+       cd packaging
+
+2. Create and activate a virtual environment:
+
+   On macOS / Linux::
+
+       python3 -m venv .venv
+       source .venv/bin/activate
+
+   On Windows (PowerShell)::
+
+       python -m venv .venv
+       .venv\Scripts\Activate.ps1
+
+3. Install the package in editable mode along with its test dependencies::
+
+       pip install --upgrade pip
+       pip install -e . --group test
+
+   If using an older ``pip`` version that does not support ``--group``, install
+   the test dependencies directly::
+
+       pip install -e . pytest pretend tomli_w hypothesis coverage
+
+4. Run the unit test suite::
+
+       pytest
+
+5. *(Optional)* Build source and wheel distributions::
+
+       pip install build
+       python -m build
+
 Discussion
 ----------
 
