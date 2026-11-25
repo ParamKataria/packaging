@@ -795,6 +795,33 @@ def _detect_equal_wildcard(lower: LowerBound, upper: UpperBound) -> Version | No
     return lower.version.__replace__(release=lower_release, dev=None)
 
 
+def _is_local_singleton(lower: LowerBound, upper: UpperBound) -> bool:
+    """Return True for an inclusive local point ``[V+local, V+local]``."""
+    if not (lower.inclusive and upper.inclusive):
+        return False
+    if lower.version is None or upper.version is None:
+        return False
+    if isinstance(lower.version, BoundaryVersion) or isinstance(
+        upper.version, BoundaryVersion
+    ):
+        return False
+    return lower.version == upper.version and lower.version.local is not None
+
+
+def _is_plain_singleton(lower: LowerBound, upper: UpperBound) -> bool:
+    """Return True for a plain singleton ``[V, AFTER_LOCALS(V)]``."""
+    if not (lower.inclusive and upper.inclusive):
+        return False
+    if not isinstance(lower.version, Version):
+        return False
+    if not isinstance(upper.version, BoundaryVersion):
+        return False
+    return (
+        upper.version.kind == BoundaryKind.AFTER_LOCALS
+        and upper.version.version == lower.version
+    )
+
+
 def _encode_interval(
     lower: LowerBound, upper: UpperBound, keep_dev0: bool
 ) -> list[str] | None:
@@ -804,29 +831,10 @@ def _encode_interval(
     ``V``, and ``[V+local, V+local]`` for a local one) and the ``==V.*`` shape
     so the fragment is one equality rather than a bound pair.
     """
-    # ``[V+local, V+local]`` (an inclusive local point) is the singleton ``==V+local``.
-    if (
-        lower.version is not None
-        and upper.version is not None
-        and not isinstance(lower.version, BoundaryVersion)
-        and not isinstance(upper.version, BoundaryVersion)
-        and lower.inclusive
-        and upper.inclusive
-        and lower.version == upper.version
-        and lower.version.local is not None
-    ):
+    if _is_local_singleton(lower, upper):
         return [f"=={lower.version}"]
 
-    # ``[V, AFTER_LOCALS(V)]`` (V without a local) is the singleton ``==V``,
-    # which also matches V's local family: one equality, not ``>=V,<=V``.
-    if (
-        isinstance(lower.version, Version)
-        and lower.inclusive
-        and upper.inclusive
-        and isinstance(upper.version, BoundaryVersion)
-        and upper.version.kind == BoundaryKind.AFTER_LOCALS
-        and upper.version.version == lower.version
-    ):
+    if _is_plain_singleton(lower, upper):
         return [f"=={lower.version}"]
 
     wildcard = _detect_equal_wildcard(lower, upper)
