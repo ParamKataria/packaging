@@ -363,6 +363,86 @@ class RFC822Message(email.message.EmailMessage):
         return self.as_string(unixfrom, policy=policy).encode("utf-8")
 
 
+def _decode_email_headers(headers: list[Any]) -> tuple[list[str], bool]:
+    """Decode raw email header values into strings and report UTF-8 validity."""
+    values: list[str] = []
+    valid_encoding = True
+    for header in headers:
+        assert isinstance(header, (email.header.Header, str))
+        if isinstance(header, email.header.Header):
+            chunks: list[tuple[bytes, str | None]] = []
+            for binary, _encoding in email.header.decode_header(header):
+                try:
+                    binary.decode("utf8", "strict")
+                except UnicodeDecodeError:
+                    # Enable mojibake.
+                    encoding = "latin1"
+                    valid_encoding = False
+                else:
+                    encoding = "utf8"
+                chunks.append((binary, encoding))
+            values.append(str(email.header.make_header(chunks)))
+        else:
+            values.append(header)
+    return values, valid_encoding
+
+
+def _store_email_header_field(
+    name: str,
+    value: list[str],
+    raw: dict[str, str | list[str] | dict[str, str]],
+    unparsed: dict[str, list[str]],
+) -> None:
+    """Classify and store a decoded header field in *raw* or *unparsed*."""
+    raw_name = _EMAIL_TO_RAW_MAPPING.get(name)
+    if raw_name is None:
+        unparsed[name] = value
+        return
+
+    if raw_name in _STRING_FIELDS and len(value) == 1:
+        raw[raw_name] = value[0]
+    elif raw_name == "import_names" and value == [""]:
+        raw[raw_name] = []
+    elif raw_name in _LIST_FIELDS:
+        raw[raw_name] = value
+    elif raw_name == "keywords" and len(value) == 1:
+        raw[raw_name] = _parse_keywords(value[0])
+    elif raw_name == "project_urls":
+        try:
+            raw[raw_name] = _parse_project_urls(value)
+        except KeyError:
+            unparsed[name] = value
+    else:
+        unparsed[name] = value
+
+
+def _merge_email_payload(
+    parsed: email.message.Message,
+    data: bytes | str,
+    raw: dict[str, str | list[str] | dict[str, str]],
+    unparsed: dict[str, list[str]],
+) -> None:
+    """Extract the message body payload and reconcile it with description headers."""
+    try:
+        payload = _get_payload(parsed, data)
+    except ValueError:
+        unparsed.setdefault("description", []).append(
+            parsed.get_payload(decode=isinstance(data, bytes))  # type: ignore[call-overload]
+        )
+        return
+
+    if not payload:
+        return
+
+    if "description" in raw:
+        description_header = cast("str", raw.pop("description"))
+        unparsed.setdefault("description", []).extend([description_header, payload])
+    elif "description" in unparsed:
+        unparsed["description"].append(payload)
+    else:
+        raw["description"] = payload
+
+
 def parse_email(data: bytes | str) -> tuple[RawMetadata, dict[str, list[str]]]:
     """Parse a distribution's metadata stored as email headers (e.g. from ``METADATA``).
 
@@ -387,160 +467,20 @@ def parse_email(data: bytes | str) -> tuple[RawMetadata, dict[str, list[str]]]:
     else:
         parsed = email.parser.BytesParser(policy=email.policy.compat32).parsebytes(data)
 
-    # We have to wrap parsed.keys() in a set, because in the case of multiple
-    # values for a key (a list), the key will appear multiple times in the
-    # list of keys, but we're avoiding that by using get_all().
+    # Wrap keys in a set to avoid processing repeated headers multiple times.
     for name_with_case in frozenset(parsed.keys()):
-        # Header names in RFC are case insensitive, so we'll normalize to all
-        # lower case to make comparisons easier.
         name = name_with_case.lower()
-
-        # We use get_all() here, even for fields that aren't multiple use,
-        # because otherwise someone could have e.g. two Name fields, and we
-        # would just silently ignore it rather than doing something about it.
         headers = parsed.get_all(name) or []
+        value, valid_encoding = _decode_email_headers(headers)
 
-        # The way the email module works when parsing bytes is that it
-        # unconditionally decodes the bytes as ascii using the surrogateescape
-        # handler. When you pull that data back out (such as with get_all() ),
-        # it looks to see if the str has any surrogate escapes, and if it does
-        # it wraps it in a Header object instead of returning the string.
-        #
-        # As such, we'll look for those Header objects, and fix up the encoding.
-        value = []
-        # Flag if we have run into any issues processing the headers, thus
-        # signalling that the data belongs in 'unparsed'.
-        valid_encoding = True
-        for h in headers:
-            # It's unclear if this can return more types than just a Header or
-            # a str, so we'll just assert here to make sure.
-            assert isinstance(h, (email.header.Header, str))
-
-            # If it's a header object, we need to do our little dance to get
-            # the real data out of it. In cases where there is invalid data
-            # we're going to end up with mojibake, but there's no obvious, good
-            # way around that without reimplementing parts of the Header object
-            # ourselves.
-            #
-            # That should be fine since, if mojibacked happens, this key is
-            # going into the unparsed dict anyways.
-            if isinstance(h, email.header.Header):
-                # The Header object stores it's data as chunks, and each chunk
-                # can be independently encoded, so we'll need to check each
-                # of them.
-                chunks: list[tuple[bytes, str | None]] = []
-                for binary, _encoding in email.header.decode_header(h):
-                    try:
-                        binary.decode("utf8", "strict")
-                    except UnicodeDecodeError:
-                        # Enable mojibake.
-                        encoding = "latin1"
-                        valid_encoding = False
-                    else:
-                        encoding = "utf8"
-                    chunks.append((binary, encoding))
-
-                # Turn our chunks back into a Header object, then let that
-                # Header object do the right thing to turn them into a
-                # string for us.
-                value.append(str(email.header.make_header(chunks)))
-            # This is already a string, so just add it.
-            else:
-                value.append(h)
-
-        # We've processed all of our values to get them into a list of str,
-        # but we may have mojibake data, in which case this is an unparsed
-        # field.
         if not valid_encoding:
             unparsed[name] = value
             continue
 
-        raw_name = _EMAIL_TO_RAW_MAPPING.get(name)
-        if raw_name is None:
-            # This is a bit of a weird situation, we've encountered a key that
-            # we don't know what it means, so we don't know whether it's meant
-            # to be a list or not.
-            #
-            # Since we can't really tell one way or another, we'll just leave it
-            # as a list, even though it may be a single item list, because that's
-            # what makes the most sense for email headers.
-            unparsed[name] = value
-            continue
+        _store_email_header_field(name, value, raw, unparsed)
 
-        # If this is one of our string fields, then we'll check to see if our
-        # value is a list of a single item. If it is then we'll assume that
-        # it was emitted as a single string, and unwrap the str from inside
-        # the list.
-        #
-        # If it's any other kind of data, then we haven't the faintest clue
-        # what we should parse it as, and we have to just add it to our list
-        # of unparsed stuff.
-        if raw_name in _STRING_FIELDS and len(value) == 1:
-            raw[raw_name] = value[0]
-        # If this is import_names, we need to special case the empty field
-        # case, which converts to an empty list instead of None. We can't let
-        # the empty case slip through, as it will fail validation.
-        elif raw_name == "import_names" and value == [""]:
-            raw[raw_name] = []
-        # If this is one of our list of string fields, then we can just assign
-        # the value, since email *only* has strings, and our get_all() call
-        # above ensures that this is a list.
-        elif raw_name in _LIST_FIELDS:
-            raw[raw_name] = value
-        # Special Case: Keywords
-        # The keywords field is implemented in the metadata spec as a str,
-        # but it conceptually is a list of strings, and is serialized using
-        # ", ".join(keywords), so we'll do some light data massaging to turn
-        # this into what it logically is.
-        elif raw_name == "keywords" and len(value) == 1:
-            raw[raw_name] = _parse_keywords(value[0])
-        # Special Case: Project-URL
-        # The project urls is implemented in the metadata spec as a list of
-        # specially-formatted strings that represent a key and a value, which
-        # is fundamentally a mapping, however the email format doesn't support
-        # mappings in a sane way, so it was crammed into a list of strings
-        # instead.
-        #
-        # We will do a little light data massaging to turn this into a map as
-        # it logically should be.
-        elif raw_name == "project_urls":
-            try:
-                raw[raw_name] = _parse_project_urls(value)
-            except KeyError:
-                unparsed[name] = value
-        # Nothing that we've done has managed to parse this, so it'll just
-        # throw it in our unparsable data and move on.
-        else:
-            unparsed[name] = value
+    _merge_email_payload(parsed, data, raw, unparsed)
 
-    # We need to support getting the Description from the message payload in
-    # addition to getting it from the headers. This does mean, though, there
-    # is the possibility of it being set both ways, in which case we put both
-    # in 'unparsed' since we don't know which is right.
-    try:
-        payload = _get_payload(parsed, data)
-    except ValueError:
-        unparsed.setdefault("description", []).append(
-            parsed.get_payload(decode=isinstance(data, bytes))  # type: ignore[call-overload]
-        )
-    else:
-        if payload:
-            # Check to see if we've already got a description, if so then both
-            # it, and this body move to unparsable.
-            if "description" in raw:
-                description_header = cast("str", raw.pop("description"))
-                unparsed.setdefault("description", []).extend(
-                    [description_header, payload]
-                )
-            elif "description" in unparsed:
-                unparsed["description"].append(payload)
-            else:
-                raw["description"] = payload
-
-    # We need to cast our `raw` to a metadata, because a TypedDict only support
-    # literal key names, but we're computing our key names on purpose, but the
-    # way this function is implemented, our `TypedDict` can only have valid key
-    # names.
     return cast("RawMetadata", raw), unparsed
 
 
