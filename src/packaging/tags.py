@@ -389,7 +389,9 @@ def _cpython_abis(py_version: PythonVersion, warn: bool = False) -> Iterator[str
     # extension modules is the best option.
     # https://github.com/pypa/pip/issues/3383#issuecomment-173267692
     has_ext = "_d.pyd" in EXTENSION_SUFFIXES
-    if with_debug or (with_debug is None and (has_refcount or has_ext)):
+    has_inferred_debug = with_debug is None and (has_refcount or has_ext)
+    is_debug_build = bool(with_debug) or has_inferred_debug
+    if is_debug_build:
         debug = "d"
     if py_version >= (3, 13) and _get_config_var("Py_GIL_DISABLED", warn):
         threading = "t"
@@ -399,9 +401,9 @@ def _cpython_abis(py_version: PythonVersion, warn: bool = False) -> Iterator[str
             pymalloc = "m"
         if py_version < (3, 3):
             unicode_size = _get_config_var("Py_UNICODE_SIZE", warn)
-            if unicode_size == 4 or (
-                unicode_size is None and sys.maxunicode == 0x10FFFF
-            ):
+            has_explicit_ucs4 = unicode_size == 4
+            has_inferred_ucs4 = unicode_size is None and sys.maxunicode == 0x10FFFF
+            if has_explicit_ucs4 or has_inferred_ucs4:
                 ucs4 = "u"
     yield f"cp{version}{threading}{debug}{pymalloc}{ucs4}"
     if py_version >= (3, 8) and debug:
